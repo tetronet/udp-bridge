@@ -1,28 +1,25 @@
 ﻿using ModemAPI;
+using System.Buffers.Binary;
 using System.Collections.Concurrent;
+using System.IO.Hashing;
 using System.Net;
 using System.Net.Sockets;
-
-Console.WriteLine("UDP-Bridge v1.0 (Optimized for Tetronet)");
+using System.Threading.Channels;
 
 string[] config = File.ReadAllLines("config.txt");
-
-Address? wantedAddress = null;
-Random rnd = new Random();
-if (File.Exists("ci_address.txt"))
+if (config[0] != "client")
 {
-    wantedAddress = new(File.ReadAllText("ci_address.txt"));
-}
-if (config[0] != "server")
-{
-    Console.WriteLine("Server config parsing error: terminating");
+    Console.WriteLine("Client config parsing error: terminating");
     Thread.Sleep(5000);
-    throw new FormatException("config line 1 not \"server\"");
+    throw new FormatException("config line 1 not \"client\"");
 }
-string wsProvider = config[1];
-string ipAddressDest = config[2];
-string ipAddressPort = config[3];
+string websocketProviderUrl = config[1];
+string destination = config[2];
+string port = config[3];
 string verbosity = config[4];
+string bigpings = config[5];
+string virtualOrCiocil = config[6];
+string wiretype = config[7];
 void DebugOutput(object d)
 {
     if (verbosity == "verbose")
@@ -31,407 +28,260 @@ void DebugOutput(object d)
     }
 }
 IModem modem;
-if (config[5] == "virtual")
+if (virtualOrCiocil == "virtual")
 {
-    modem = new VirtualModem(wsProvider, new(wantedAddress ?? new(), true, null));
+    modem = new VirtualModem(websocketProviderUrl, new());
 }
-else if (config[5] == "ciocil")
+else if (virtualOrCiocil == "ciocil")
 {
-    LowLatencyPhysicalModem mdm = new(wsProvider.Split(' ')[0], int.Parse(wsProvider.Split(' ')[1]), L1Types.L1_SERIAL, true);
-    mdm.AttachCRCMismatchEvent(delegate ()
+    L1Types wt = L1Types.L1_SERIAL;
+    if (wiretype == "tcp")
     {
-        Console.WriteLine("[WARNING]: CRC-32 Mismatched on the Level One");
+        wt = L1Types.L1_INET_TCP;
+    }
+    else if (wiretype == "serport")
+    {
+        wt = L1Types.L1_SERIAL;
+    }
+    LowLatencyPhysicalModem modem_ = new(websocketProviderUrl.Split(' ')[0], int.Parse(websocketProviderUrl.Split(' ')[1]), wt, true);
+    modem_.AttachCRCMismatchEvent(delegate ()
+    {
+        Console.WriteLine("CRC-32 mismatched on the Level Two of the tetronet stack!");
     });
-    mdm.L1DroppedData += delegate (L1DropBytesReasons reason, int count)
+    modem_.InternalErrorHappened += delegate (Exception error, ErrorEmitter errorEmitter)
     {
-        Console.WriteLine($"[WARNING]: Level One dropped {count} bytes, reason is {reason}");
+        Console.WriteLine($"Physical error sent by {errorEmitter}: {error}");
     };
-    modem = mdm;    
+    modem = modem_;
 }
 else
 {
-    throw new FormatException("sixth line of the config must be \"virtual\" for tetronet over socket.io or \"ciocil\" for tetronet over serial (LL-CIoCIL-mini)");
+    throw new FormatException("you must use virtual for socket.io connection or ciocil for low latency serial connections");
 }
 modem.Dial();
-Console.Write("[PROCESS]: Connecting");
+Console.Write("Connecting");
 while (!modem.IsModemConnected)
 {
     Console.Write(".");
     Thread.Sleep(10);
 }
+Random rnd = new Random();
 Console.WriteLine("OK");
-Console.WriteLine("[INFO]: Connected to tetronet with address " + (modem.LocalModemAddress ?? throw new NullAddressException()).AddressValue);
-File.WriteAllText("ci_address.txt", modem.LocalModemAddress.AddressValue);
+Console.WriteLine("Connected to the Tetronet with address " + (modem.LocalModemAddress ?? throw new NullAddressException()).AddressValue);
 
-// Словари для UDP
-ConcurrentDictionary<UdpClient, Address> udpAddressMap = [];  // Dest IP string -> Tetronet Address
-ConcurrentDictionary<uint, UdpClient> udpClients = [];        // ConnectionID -> UdpClient
-ConcurrentDictionary<UdpClient, uint> udpConnectionMap = [];  // UdpClient -> ConnectionID
-ConcurrentDictionary<uint, MemoryStream> udpBuffers = [];     // Буферы для UDP датаграмм
+// Создаем UDP сокет для прослушивания
+UdpClient udpServer = new(int.Parse(port));
+// Making anormous buffer size for this UDP client.
+udpServer.Client.ReceiveBufferSize = 16 * 1024 * 1024; // 16 Mbytes
+udpServer.Client.SendBufferSize = 16 * 1024 * 1024;
+IPEndPoint remoteEndPoint = new(IPAddress.Any, 0);
+Console.WriteLine($"UDP server listening on port {port}");
 
-modem.AttachReceiveEventNoUnfragment(delegate (Packet received, Action k)
+// Словарь для хранения активных UDP клиентов (по remote endpoint + connectionId)
+ConcurrentDictionary<string, UdpClientInfo> activeConnections = new();
+
+// Канал для входящих UDP сообщений
+Channel<UdpMessage> udpReceiveChannel = Channel.CreateUnbounded<UdpMessage>();
+
+// Канал для исходящих UDP сообщений от Tetronet
+Channel<UdpMessage> udpSendChannel = Channel.CreateUnbounded<UdpMessage>();
+
+ConcurrentDictionary<uint, long> pendingPings = []; // ping connection ID -> timestamp
+
+// handle single ping
+if (bigpings == "singleping")
 {
-    DebugOutput($"[INFO]: Type: {received.QueryType}");
-    DebugOutput($"        Length: {received.DataBytes.Count}");
-    DebugOutput($"        ConnectionID: {received.ConnectionID}");
-
-    if (received.QueryType == "ping")
-    {
-        _ = Task.Run(delegate ()
-        {
-            try
-            {
-                // Transmit different data in a ping packet to pevent network from caching the request
-                if (received.DataBytes.Count < 100)
-                {
-                    modem.Transmit([0x00], received.Transmitter, "pong", received.ConnectionID);
-                    Console.WriteLine($"[EVENT]: Response for client's ping packet (ping connection id is {received.ConnectionID})");
-                }
-                else
-                {
-                    byte[] pingData = new byte[rnd.Next(30000)];
-                    rnd.NextBytes(pingData);
-                    modem.Transmit(pingData, received.Transmitter, "pong", received.ConnectionID, null, 30000);
-                    Console.WriteLine($"[EVENT]: Response for client's ping packet (ping connection id is {received.ConnectionID})");
-                }
-            }
-            catch
-            {
-                DebugOutput("[ERROR]: Failed to answer to ping request");
-            }
-        });
-    }
-
-    if (received.QueryType == "udp") // Изменено с "tcp" на "udp"
-    {
-        try
-        {
-            if (!udpBuffers.ContainsKey(received.ConnectionID))
-                udpBuffers[received.ConnectionID] = new MemoryStream();
-
-            var buffer = udpBuffers[received.ConnectionID];
-
-            // Для UDP записываем данные напрямую, без буферизации по длине
-            // UDP датаграммы приходят целиком, но Tetronet может фрагментировать
-            buffer.Write([.. received.DataBytes], 0, received.DataBytes.Count);
-
-            // Выводим Cyclic Redundancy Check 32 чтобы проверить, ломает ли тетронет бинарное тело пакета
-            //DebugOutput("[INFO]: Packet received with CRC-32 of " + Crc32.HashToUInt32([..received.DataBytes]));
-
-            // Обрабатываем полные UDP датаграммы
-            ProcessUdpDatagrams(received.ConnectionID);
-        }
-        catch (Exception ex)
-        {
-            DebugOutput($"[ERROR]: Processing UDP data failed: {ex.Message}");
-        }
-    }
-
-    if (received.QueryType == "udp_connect") // Изменено с "tcp_connect" на "udp_connect"
-    {
-        try
-        {
-            Console.WriteLine("[EVENT]: Received udp_connect packet for connection " + received.ConnectionID);
-            if (!udpClients.TryGetValue(received.ConnectionID, out UdpClient? value))
-            {
-                Console.WriteLine("[INFO]: Creating UDP client: " + received.ConnectionID);
-
-                IPAddress dest = IPAddress.Parse(ipAddressDest);
-                int port = int.Parse(ipAddressPort);
-
-                Console.WriteLine($"[INFO]: Target IP:Port = {dest}:{port}");
-
-                // Для UDP не нужно вызывать Connect(), просто создаем UdpClient
-                var udpClient = new UdpClient();
-
-                // Можно привязать к локальному порту для получения ответов
-                udpClient.Client.Bind(new IPEndPoint(IPAddress.Any, 0));
-                udpClient.Connect(dest, port);
-                // Сохраняем клиент
-                udpClients[received.ConnectionID] = udpClient;
-                udpAddressMap[udpClient] = received.Transmitter;
-                udpConnectionMap[udpClient] = received.ConnectionID;
-
-                // Создаём буфер для этого соединения
-                udpBuffers[received.ConnectionID] = new MemoryStream();
-
-                // Запускаем асинхронное чтение из UDP сокета
-                _ = Task.Run(() => ReadFromUdpAsync(received.ConnectionID, udpClient, dest, port));
-            }
-            else
-            {
-                Console.WriteLine("[ERROR]: Cannot create UDP client, connection already exists: " + received.ConnectionID);
-            }
-        }
-        catch (Exception e)
-        {
-            Console.WriteLine($"[ERROR]: UDP client creation failed: {e}: {e.Message}");
-        }
-    }
-
-    if (received.QueryType == "udp_reset") // Изменено с "tcp_reset" на "udp_reset"
-    {
-        try
-        {
-            if (udpClients.ContainsKey(received.ConnectionID))
-            {
-                string ipToRemove = "";
-                if (udpClients[received.ConnectionID].Client.RemoteEndPoint != null)
-                {
-                    ipToRemove = ((IPEndPoint)(udpClients[received.ConnectionID].Client.RemoteEndPoint ?? throw new NullAddressException("null ip endpoint"))).Address.MapToIPv4().ToString();
-                }
-                else
-                {
-                    // Если RemoteEndPoint недоступен, ищем по ConnectionID в udpConnectionMap
-                    var entry = udpConnectionMap.FirstOrDefault(x => x.Value == received.ConnectionID);
-                    ipToRemove = ((IPEndPoint)(entry.Key.Client.RemoteEndPoint ?? throw new NullAddressException("null ip endpoint"))).Address.MapToIPv4().ToString();
-                }
-
-                udpAddressMap.TryRemove(udpClients[received.ConnectionID], out _);
-                udpConnectionMap.TryRemove(udpClients[received.ConnectionID], out _);
-                udpBuffers.TryRemove(received.ConnectionID, out _);
-
-                udpClients[received.ConnectionID].Close();
-                udpClients.TryRemove(received.ConnectionID, out _);
-
-                Console.WriteLine("[INFO]: UDP client was closed (UDP RESET)");
-            }
-        }
-        catch (Exception ex)
-        {
-            Console.WriteLine($"[ERROR]: UDP reset has failed: {ex.Message}");
-        }
-    }
-});
-
-// Функция обработки UDP датаграмм (для UDP не нужны заголовки длины, но Tetronet может фрагментировать)
-void ProcessUdpDatagrams(uint connectionId)
-{
-    if (!udpBuffers.ContainsKey(connectionId) || !udpClients.ContainsKey(connectionId))
-        return;
-
-    var buffer = udpBuffers[connectionId];
-    var udpClient = udpClients[connectionId];
-
-    // Для UDP мы получаем уже готовые датаграммы от Tetronet
-    // Но так как Tetronet может фрагментировать, используем подход с разделителями
-    // или просто отправляем всё как есть, так как UDP - это дейтаграммный протокол
-
-    // Получаем все данные из буфера
-    byte[] allData = buffer.ToArray();
-    if (allData.Length == 0)
-        return;
-
-    try
-    {
-        // Для UDP отправляем данные как есть - это уже полная датаграмма
-        // Если Tetronet фрагментирует, нужно будет собирать, но обычно UDP датаграммы приходят целиком
-        if (udpClient.Client != null)
-        {
-            // Получаем endpoint для отправки
-            var remoteEndpoint = (IPEndPoint?)udpClient.Client.RemoteEndPoint;
-            if (remoteEndpoint != null)
-            {
-                udpClient.SendAsync(allData/*, allData.Length, remoteEndpoint*/);
-                DebugOutput($"[EVENT]: Sent UDP datagram of {allData.Length} bytes to {remoteEndpoint.Address}:{remoteEndpoint.Port}");
-
-                // Очищаем буфер после отправки
-                buffer.SetLength(0);
-                buffer.Position = 0;
-            }
-            else
-            {
-                DebugOutput($"[WARNING]: No remote endpoint for connection {connectionId}");
-            }
-        }
-    }
-    catch (Exception ex)
-    {
-        DebugOutput($"[ERROR]: Sending UDP datagram failed: {ex.Message}");
-        // Не очищаем буфер, чтобы можно было повторить попытку
-    }
+    Console.WriteLine($"Ping sent with Connection ID of 500000000");
+    modem.Transmit([0x00], new(destination), "ping", 500000000);
 }
 
-// Асинхронное чтение из UDP сокета
-async Task ReadFromUdpAsync(uint connectionId, UdpClient udpClient, IPAddress targetAddress, int targetPort)
+// Ping задача
+_ = Task.Run(async delegate ()
 {
-    byte[] buffer = new byte[65535]; // Максимальный размер UDP датаграммы
-
-    try
-    {
-        // Для UDP используем ReceiveAsync без предварительного Connect
-        // или с Connect, если нужно фильтровать только от одного endpoint
-
-        // Вариант 1: без Connect (получаем от всех)
-        // while (true)
-        // {
-        //     var result = await udpClient.ReceiveAsync();
-        //     // Обработка...
-        // }
-
-        // Вариант 2: с Connect (получаем только от targetAddress:targetPort)
-        // udpClient.Connect(targetAddress, targetPort);
-
-        // Используем вариант с Connect для лучшей производительности
-        udpClient.Connect(targetAddress, targetPort);
-
-        while (udpClient.Client != null && udpClient.Client.Connected)
-        {
-            try
-            {
-                // Получаем UDP датаграмму
-                var result = await udpClient.ReceiveAsync();
-                int bytesRead = result.Buffer.Length;
-
-                if (bytesRead == 0)
-                {
-                    // Нормальная ситуация для UDP - датаграмма нулевой длины
-                    continue;
-                }
-
-                // Получены данные из UDP, отправляем в Tetronet
-                byte[] data = new byte[bytesRead];
-                Array.Copy(result.Buffer, data, bytesRead);
-
-                // Получаем адрес назначения для отправки
-                string destIp = targetAddress.MapToIPv4().ToString();
-
-                if (udpAddressMap.ContainsKey(udpClient) && udpConnectionMap.ContainsKey(udpClient))
-                {
-                    // Отправляем как UDP пакет в Tetronet
-                    modem.Transmit(data, udpAddressMap[udpClient], "udp", udpConnectionMap[udpClient], null, 30000, 0);
-                    DebugOutput($"[EVENT]: Transmitted UDP datagram of {bytesRead} bytes from {connectionId} to Tetronet");
-                }
-                else
-                {
-                    Console.WriteLine($"[ERROR]: No mapping for destination {destIp}");
-                }
-            }
-            catch (SocketException ex) when (ex.SocketErrorCode == SocketError.TimedOut)
-            {
-                // Таймаут - нормально для UDP, продолжаем
-                continue;
-            }
-            catch (Exception ex)
-            {
-                Console.WriteLine($"[ERROR]: Reading from UDP {connectionId} failed: {ex.Message}");
-                break;
-            }
-        }
-    }
-    catch (Exception ex)
-    {
-        Console.WriteLine($"[ERROR]: UDP receive loop failed for {connectionId}: {ex.Message}");
-    }
-    finally
-    {
-        // Очистка при закрытии
-        await CleanupUdpConnection(connectionId, udpClient);
-    }
-}
-
-async Task CleanupUdpConnection(uint connectionId, UdpClient udpClient)
-{
-    if (udpClients.ContainsKey(connectionId))
-    {
-        UdpClient? clToRemove = null;
-
-        // Пытаемся получить IP для очистки маппингов
-        var entry = udpConnectionMap.FirstOrDefault(x => x.Value == connectionId);
-        if (entry.Key != null)
-        {
-            clToRemove = entry.Key;
-        }
-        else if (udpClient.Client.RemoteEndPoint != null)
-        {
-            clToRemove = udpClient;
-        }
-
-        if (clToRemove != null)
-        {
-            udpAddressMap.TryRemove(clToRemove, out _);
-            udpConnectionMap.TryRemove(clToRemove, out _);
-        }
-
-        udpBuffers.TryRemove(connectionId, out _);
-
-        try
-        {
-            udpClient.Close();
-        }
-        catch { }
-
-        udpClients.TryRemove(connectionId, out _);
-
-        // Уведомляем другую сторону о закрытии
-        if (clToRemove != null && udpAddressMap.TryGetValue(clToRemove, out Address? addr))
-        {
-            Console.WriteLine($"[INFO]: Connection for UDP client {connectionId} with dest IP {clToRemove} was closed");
-            Console.WriteLine($"[INFO]: Transmitting udp_reset to address {addr.AddressValue}");
-
-            try
-            {
-                await Task.Run(() => modem.Transmit([0x00], addr, "udp_reset", connectionId));
-                Console.WriteLine($"[INFO]: Transmitted udp_reset signal for {connectionId} to tetronet for IP {clToRemove}");
-            }
-            catch (Exception ex)
-            {
-                Console.WriteLine($"[ERROR]: Failed to send udp_reset: {ex.Message}");
-            }
-        }
-
-        Console.WriteLine($"[INFO]: Connection {connectionId} cleaned up after UDP close");
-    }
-}
-
-// Timeout cleanup для UDP соединений
-_ = Task.Run(async () =>
-{
+    uint currentPingConid = 0;
     while (true)
     {
-        await Task.Delay(30000); // Каждые 30 секунд
-
-        List<uint> deadConnections = [];
-
-        foreach (var kv in udpClients)
+        try
         {
-            try
+            // Transmit different data in a ping packet to prevent network from caching the request
+            if (bigpings == "bigping")
             {
-                // Для UDP проверяем, жив ли сокет
-                if (kv.Value.Client == null || !kv.Value.Client.IsBound)
-                {
-                    deadConnections.Add(kv.Key);
-                    Console.WriteLine("[WARNING]: Detected dead UDP client. This client is going to be deleted.");
-                    Console.WriteLine("           ClientID: " + kv.Key);
-                    continue;
-                }
-
-                // Проверка через Poll для UDP
-                if (kv.Value.Client.Poll(0, SelectMode.SelectError))
-                {
-                    deadConnections.Add(kv.Key);
-                    Console.WriteLine($"[WARNING]: UDP client {kv.Key} has error state");
-                }
+                int size = rnd.Next(25000);
+                byte[] pingData = new byte[size];
+                rnd.NextBytes(pingData);
+                Console.WriteLine($"Ping sent with Connection ID of {currentPingConid}");
+                modem.Transmit(pingData, new(destination), "ping", currentPingConid, null, 30000);
             }
-            catch (Exception e)
+            else if (bigpings == "ping")
             {
-                Console.WriteLine($"[ERROR]: Connection had a fatal failure: {e}");
-                deadConnections.Add(kv.Key);
+                Console.WriteLine($"Ping sent with Connection ID of {currentPingConid}");
+                modem.Transmit([0x00], new(destination), "ping", currentPingConid);
             }
+            pendingPings.TryAdd(currentPingConid, DateTime.Now.Ticks);
+            currentPingConid++;
+            await Task.Delay(rnd.Next(100, 10000));
         }
-
-        foreach (var id in deadConnections)
+        catch
         {
-            Console.WriteLine($"[INFO]: Connection {id} detected as dead, cleaning up");
-            if (udpClients.TryGetValue(id, out UdpClient? client))
-            {
-                await CleanupUdpConnection(id, client);
-            }
+            Console.WriteLine("Failed to transmit ping: refused");
         }
     }
 });
 
+// Обработчик входящих данных из Tetronet (UDP)
+modem.AttachReceiveEventNoUnfragment(delegate (Packet data, Action k)
+{
+    if (data.QueryType == "pong" && pendingPings.TryGetValue(data.ConnectionID, out long pingTimestamp))
+    {
+        Console.WriteLine($"Pong received with Connection ID of {data.ConnectionID} in {(DateTime.Now.Ticks - pingTimestamp) / 10000m}ms");
+    }
+    if (data.QueryType == "udp" && data.Transmitter.AddressValue == destination)
+    {
+        uint connectionId = data.ConnectionID;
+        byte[] dataBytes = data.DataBytes.ToArray();
 
+        // Ищем клиента по connectionId
+        var clientInfo = activeConnections.Values.FirstOrDefault(c => c.ConnectionId == connectionId);
+        if (clientInfo != null)
+        {
+            // Отправляем данные UDP клиенту
+            try
+            {
+                udpServer.SendAsync(dataBytes, dataBytes.Length, clientInfo.RemoteEndPoint);
+                DebugOutput($"Sent {dataBytes.Length} bytes to UDP client {clientInfo.RemoteEndPoint} for connection {connectionId}");
+            }
+            catch (Exception ex)
+            {
+                DebugOutput($"Error sending UDP to client: {ex.Message}");
+                if (clientInfo.Key != null)
+                {
+                    activeConnections.TryRemove(clientInfo.Key, out _);
+                }
+            }
+        }
+        else
+        {
+            Console.WriteLine($"Client wasn't found: {connectionId}");
+        }
+    }
+    else if (data.QueryType == "udp_heartbeat" && data.Transmitter.AddressValue == destination)
+    {
+        uint connectionId = data.ConnectionID;
+        var clientInfo = activeConnections.Values.FirstOrDefault(c => c.ConnectionId == connectionId);
+        if (clientInfo != null)
+        {
+            DebugOutput($"Heartbeat for connection {connectionId} - {clientInfo.RemoteEndPoint}");
+        }
+    }
+    else if (data.QueryType == "udp_reset" && data.Transmitter.AddressValue == destination)
+    {
+        uint connectionId = data.ConnectionID;
+        var clientInfo = activeConnections.Values.FirstOrDefault(c => c.ConnectionId == connectionId);
+        if (clientInfo != null)
+        {
+            Console.WriteLine($"Received UDP_RESET for connection {connectionId}");
+            if (clientInfo.Key != null)
+            {
+                activeConnections.TryRemove(clientInfo.Key, out _);
+            }
+        }
+        else
+        {
+            Console.WriteLine($"Failed to reset for connection {connectionId}");
+        }
+    }
+});
 
-Console.WriteLine("[STATUS]: Waiting for UDP clients...");
-Console.ReadLine();
+// Запускаем обработчик входящих UDP сообщений
+_ = Task.Run(async () =>
+{
+    //uint nextConnectionId = 1;
+
+    while (true)
+    {
+        try
+        {
+            // Получаем UDP пакет
+            var result = await udpServer.ReceiveAsync();
+            byte[] receivedData = result.Buffer;
+            remoteEndPoint = result.RemoteEndPoint;
+
+            // Создаем ключ для клиента
+            string clientKey = $"{remoteEndPoint.Address}:{remoteEndPoint.Port}";
+
+            // Проверяем, есть ли уже соединение для этого клиента
+            if (!activeConnections.TryGetValue(clientKey, out var clientInfo))
+            {
+                // Новый клиент - создаем новое соединение
+                uint connectionId = (uint)rnd.NextInt64(uint.MaxValue);
+                clientInfo = new UdpClientInfo
+                {
+                    ConnectionId = connectionId,
+                    RemoteEndPoint = remoteEndPoint,
+                    Key = clientKey
+                };
+                activeConnections[clientKey] = clientInfo;
+
+                Console.WriteLine($"NEW UDP CLIENT! Assigned ID: {connectionId} from {remoteEndPoint}");
+
+                // Отправляем сообщение о новом соединении в Tetronet
+                // В UDP не нужно устанавливать соединение, просто начинаем передачу
+                byte[] connectData = System.Text.Encoding.UTF8.GetBytes($"UDP connection from {remoteEndPoint}");
+                modem.Transmit(connectData, new Address(destination), "udp_connect", connectionId);
+                Console.WriteLine($"UDP connect sent for connection {connectionId}");
+            }
+
+            // Отправляем полученные данные в Tetronet
+            try
+            {
+                DebugOutput($"Received UDP data from {remoteEndPoint}: {receivedData.Length} bytes");
+                //ModemAPIDebugger.PrintByteArray(receivedData);
+
+                modem.Transmit(receivedData, new Address(destination), "udp", clientInfo.ConnectionId, null, 30000, 0);
+                //DebugOutput("[INFO]: Packet received with CRC-32 of " + Crc32.HashToUInt32([.. receivedData]));
+                DebugOutput($"Transmitted {receivedData.Length} bytes to Tetronet (conn {clientInfo.ConnectionId})");
+            }
+            catch (Exception ex)
+            {
+                DebugOutput($"Transmit error for {clientInfo.ConnectionId}: {ex.Message}");
+                modem.Transmit([0x00], new Address(destination), "udp_reset", clientInfo.ConnectionId);
+                activeConnections.TryRemove(clientKey, out _);
+            }
+        }
+        catch (Exception ex)
+        {
+            DebugOutput($"UDP receive error: {ex.Message}");
+            await Task.Delay(100);
+        }
+    }
+});
+
+// Фоновый мониторинг активных соединений
+while (true)
+{
+    await Task.Delay(1000);
+    DebugOutput($"Active UDP clients: {activeConnections.Count}");
+
+    // Выводим информацию о активных клиентах
+    foreach (var client in activeConnections.Values)
+    {
+        DebugOutput($"  - Connection {client.ConnectionId}: {client.RemoteEndPoint}");
+    }
+}
+
+// Класс для хранения информации о UDP клиенте
+class UdpClientInfo
+{
+    public uint ConnectionId { get; set; }
+    public IPEndPoint? RemoteEndPoint { get; set; }
+    public string? Key { get; set; }
+    public DateTime LastActivity { get; set; } = DateTime.Now;
+}
+
+// Класс для сообщений UDP
+class UdpMessage
+{
+    public byte[]? Data { get; set; }
+    public uint ConnectionId { get; set; }
+    public IPEndPoint? RemoteEndPoint { get; set; }
+}
