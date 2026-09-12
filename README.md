@@ -73,7 +73,9 @@ Well any app that doesn't care about IP-addresses and works over UDP will probab
 
 ### Linux version and other OSes
 Don't be lazy, compile it yourself, my internet is like painfully slow, and linux version is like 30 MB. Just create a new project in visual studio and copy all of the code, it's gonna work if you run these command on your project:
-```dotnet add package SocketIOClient
+```
+dotnet add package SocketIOClient
 dotnet add package System.IO.Ports
-dotnet add package System.IO.Hashing```
+dotnet add package System.IO.Hashing
+```
 Nothing more is really needed
