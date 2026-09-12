@@ -70,3 +70,10 @@ Create `config.txt` file in the same directory, as the executable file and follo
 
 ### What to do after
 Well any app that doesn't care about IP-addresses and works over UDP will probably correctly work over that bridge, but video works only over SRT, and packet_size 1200-1500, otherwise you will overload the tetronet, and reordering will prevent video from working normally, and you will get trash or a black screen on Raw UDP.
+
+### Linux version and other OSes
+Don't be lazy, compile it yourself, my internet is like painfully slow, and linux version is like 30 MB. Just create a new project in visual studio and copy all of the code, it's gonna work if you run these command on your project:
+```dotnet add package SocketIOClient
+dotnet add package System.IO.Ports
+dotnet add package System.IO.Hashing```
+Nothing more is really needed
