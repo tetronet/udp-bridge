@@ -24,7 +24,7 @@ Create `config.txt` file in the same directory, as the executable file and follo
    <UDP server IP>
    <UDP server port>
    <verbose or unverbose>
-   <L2 tetronet protocol, ciocil=physical, virtual=socket.io websocket>
+   <L2 tetronet protocol, ciocil=physical, virtual=raw websocket>
    ```
    Example:
    ```
@@ -44,7 +44,7 @@ Create `config.txt` file in the same directory, as the executable file and follo
    <verbose or unverbose>
    <ping for sending 1 byte ping packets, bigping for sending giant ping packet, a few kb each, singleping for sending exactly one tiny ping packet at the start of the program>
    <L2 tetronet protocol, ciocil=physical, virtual=socket.io websocket>
-   <if L2 is ciocil, "serport" will make it work over a serial port, and "tcp" will make it work over a TCP socket>
+   <if L2 is ciocil, "serport" will make it work over a serial port, and "tcp" will make it work over a TCP socket. For virtualModem, use "websock" for newer and faster RAWWS transport, and anything else to use legacy socket.io transport>
    ```
    Example:
    ```
@@ -65,7 +65,7 @@ Create `config.txt` file in the same directory, as the executable file and follo
    unverbose
    ping
    virtual
-   // doesn't matter what will be here for "virtual", but this line must exist to prevent failing with IndexOutOfRangeException
+   websock
    ```
 
 ### What to do after
