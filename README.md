@@ -29,7 +29,7 @@ Create `config.txt` file in the same directory, as the executable file and follo
    Example:
    ```
    server
-   wss://data-set.su:3000/
+   ws://data-set.su:30000/
    127.0.0.1
    5000
    unverbose
@@ -59,7 +59,7 @@ Create `config.txt` file in the same directory, as the executable file and follo
    ```
    ```
    client
-   wss://data-set.su:3000/
+   ws://data-set.su:30000/
    <address of the TTOI-UDP>
    5000
    unverbose
