@@ -1,4 +1,4 @@
-using ModemAPI;
+﻿using ModemAPI;
 using System.Collections.Concurrent;
 using System.Net;
 using System.Net.Sockets;
@@ -33,7 +33,7 @@ void DebugOutput(object d)
 IModem modem;
 if (config[5] == "virtual")
 {
-    modem = new VirtualModem(wsProvider, new(wantedAddress ?? new(), true, null));
+    modem = new VirtualModem(wsProvider, new(wantedAddress ?? new(), true, null), rawWs:true);
 }
 else if (config[5] == "ciocil")
 {
@@ -82,17 +82,17 @@ modem.AttachReceiveEventNoUnfragment(delegate (Packet received, Action k)
         {
             try
             {
-                // Transmit different data in a ping packet to pevent network from caching the request
+                // Transmit different data in a ping packet to prevent network from caching the request
                 if (received.DataBytes.Length < 100)
                 {
-                    modem.Transmit([0x00], received.Transmitter, "pong", received.ConnectionID);
+                    modem.LowLevelTransmit([0x00], received.Transmitter, "pong", received.ConnectionID);
                     Console.WriteLine($"[EVENT]: Response for client's ping packet (ping connection id is {received.ConnectionID})");
                 }
                 else
                 {
                     byte[] pingData = new byte[rnd.Next(30000)];
                     rnd.NextBytes(pingData);
-                    modem.Transmit(pingData, received.Transmitter, "pong", received.ConnectionID, null, 30000);
+                    modem.LowLevelTransmit(pingData, received.Transmitter, "pong", received.ConnectionID);
                     Console.WriteLine($"[EVENT]: Response for client's ping packet (ping connection id is {received.ConnectionID})");
                 }
             }
@@ -167,7 +167,7 @@ modem.AttachReceiveEventNoUnfragment(delegate (Packet received, Action k)
     {
         try
         {
-            if (udpClients.ContainsKey(received.ConnectionID))
+            if (udpClients.TryGetValue(received.ConnectionID, out UdpClient? value))
             {
                 string ipToRemove = "";
                 if (udpClients[received.ConnectionID].Client.RemoteEndPoint != null)
@@ -181,11 +181,10 @@ modem.AttachReceiveEventNoUnfragment(delegate (Packet received, Action k)
                     ipToRemove = ((IPEndPoint)(entry.Key.Client.RemoteEndPoint ?? throw new NullAddressException("null ip endpoint"))).Address.MapToIPv4().ToString();
                 }
 
-                udpAddressMap.TryRemove(udpClients[received.ConnectionID], out _);
-                udpConnectionMap.TryRemove(udpClients[received.ConnectionID], out _);
+                udpAddressMap.TryRemove(value, out _);
+                udpConnectionMap.TryRemove(value, out _);
                 udpBuffers.TryRemove(received.ConnectionID, out _);
-
-                udpClients[received.ConnectionID].Close();
+                value.Close();
                 udpClients.TryRemove(received.ConnectionID, out _);
 
                 Console.WriteLine("[INFO]: UDP client was closed (UDP RESET)");
@@ -197,49 +196,6 @@ modem.AttachReceiveEventNoUnfragment(delegate (Packet received, Action k)
         }
     }
 });
-
-// proccessing udp dgrams
-void ProcessUdpDatagrams(uint connectionId)
-{
-    if (!udpBuffers.ContainsKey(connectionId) || !udpClients.ContainsKey(connectionId))
-        return;
-
-    var buffer = udpBuffers[connectionId];
-    var udpClient = udpClients[connectionId];
-
-    // receive data
-    byte[] allData = buffer.ToArray();
-    if (allData.Length == 0)
-        return;
-
-    try
-    {
-        // forward data
-        if (udpClient.Client != null)
-        {
-            // find endpoint to send to
-            var remoteEndpoint = (IPEndPoint?)udpClient.Client.RemoteEndPoint;
-            if (remoteEndpoint != null)
-            {
-                udpClient.SendAsync(allData);
-                DebugOutput($"[EVENT]: Sent UDP datagram of {allData.Length} bytes to {remoteEndpoint.Address}:{remoteEndpoint.Port}");
-
-                // clear the buffer
-                buffer.SetLength(0);
-                buffer.Position = 0;
-            }
-            else
-            {
-                DebugOutput($"[WARNING]: No remote endpoint for connection {connectionId}");
-            }
-        }
-    }
-    catch (Exception ex)
-    {
-        DebugOutput($"[ERROR]: Sending UDP datagram failed: {ex.Message}");
-        // won't clear the buffer to retry
-    }
-}
 
 // async reading
 async Task ReadFromUdpAsync(uint connectionId, UdpClient udpClient, IPAddress targetAddress, int targetPort)
@@ -271,10 +227,10 @@ async Task ReadFromUdpAsync(uint connectionId, UdpClient udpClient, IPAddress ta
                 // Get address
                 string destIp = targetAddress.MapToIPv4().ToString();
 
-                if (udpAddressMap.ContainsKey(udpClient) && udpConnectionMap.ContainsKey(udpClient))
+                if (udpAddressMap.TryGetValue(udpClient, out Address? value) && udpConnectionMap.ContainsKey(udpClient))
                 {
                     // Send the packet over the tetronet
-                    modem.Transmit(data, udpAddressMap[udpClient], "udp", udpConnectionMap[udpClient], null, 30000, 0);
+                    modem.LowLevelTransmit(data, value, "udp", udpConnectionMap[udpClient]);
                     DebugOutput($"[EVENT]: Transmitted UDP datagram of {bytesRead} bytes from {connectionId} to Tetronet");
                 }
                 else

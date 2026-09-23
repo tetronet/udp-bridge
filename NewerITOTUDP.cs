@@ -1,4 +1,4 @@
-using ModemAPI;
+﻿using ModemAPI;
 using System.Buffers.Binary;
 using System.Collections.Concurrent;
 using System.IO.Hashing;
@@ -30,7 +30,16 @@ void DebugOutput(object d)
 IModem modem;
 if (virtualOrCiocil == "virtual")
 {
-    modem = new VirtualModem(websocketProviderUrl, new());
+    VirtualModem modem_ = new VirtualModem(websocketProviderUrl, new(), rawWs:wiretype == "websock");
+    modem_.OnReconnectWebsocket += delegate ()
+    {
+        Console.WriteLine("Raw Websocket is reconnecting...");
+    };
+    modem_.OnSuccessReconnectWebsocket += delegate ()
+    {
+        Console.WriteLine("Raw Websocket has reconnected successfully!");
+    };
+    modem = modem_;
 }
 else if (virtualOrCiocil == "ciocil")
 {
@@ -65,11 +74,11 @@ while (!modem.IsModemConnected)
     Console.Write(".");
     Thread.Sleep(10);
 }
-Random rnd = new Random();
+Random rnd = new();
 Console.WriteLine("OK");
 Console.WriteLine("Connected to the Tetronet with address " + (modem.LocalModemAddress ?? throw new NullAddressException()).AddressValue);
 
-// Создаем UDP сокет для прослушивания
+// create the udp server
 UdpClient udpServer = new(int.Parse(port));
 // Making anormous buffer size for this UDP client.
 udpServer.Client.ReceiveBufferSize = 16 * 1024 * 1024; // 16 Mbytes
@@ -86,7 +95,7 @@ ConcurrentDictionary<uint, long> pendingPings = []; // ping connection ID -> tim
 if (bigpings == "singleping")
 {
     Console.WriteLine($"Ping sent with Connection ID of 500000000");
-    modem.Transmit([0x00], new(destination), "ping", 500000000);
+    modem.LowLevelTransmit([0x00], new(destination), "ping", 500000000);
 }
 
 // Ping task
@@ -104,12 +113,12 @@ _ = Task.Run(async delegate ()
                 byte[] pingData = new byte[size];
                 rnd.NextBytes(pingData);
                 Console.WriteLine($"Ping sent with Connection ID of {currentPingConid}");
-                modem.Transmit(pingData, new(destination), "ping", currentPingConid, null, 30000);
+                modem.LowLevelTransmit(pingData, new(destination), "ping", currentPingConid);
             }
             else if (bigpings == "ping")
             {
                 Console.WriteLine($"Ping sent with Connection ID of {currentPingConid}");
-                modem.Transmit([0x00], new(destination), "ping", currentPingConid);
+                modem.LowLevelTransmit([0x00], new(destination), "ping", currentPingConid);
             }
             pendingPings.TryAdd(currentPingConid, DateTime.Now.Ticks);
             currentPingConid++;
@@ -217,7 +226,7 @@ _ = Task.Run(async () =>
                 Console.WriteLine($"NEW UDP CLIENT! Assigned ID: {connectionId} from {remoteEndPoint}");
 
                 byte[] connectData = System.Text.Encoding.UTF8.GetBytes($"UDP connection from {remoteEndPoint}");
-                modem.Transmit(connectData, new Address(destination), "udp_connect", connectionId);
+                modem.LowLevelTransmit(connectData, new Address(destination), "udp_connect", connectionId);
                 Console.WriteLine($"UDP connect sent for connection {connectionId}");
             }
 
@@ -226,13 +235,13 @@ _ = Task.Run(async () =>
             {
                 DebugOutput($"Received UDP data from {remoteEndPoint}: {receivedData.Length} bytes");
 
-                modem.Transmit(receivedData, new Address(destination), "udp", clientInfo.ConnectionId, null, 30000, 0);
+                modem.LowLevelTransmit(receivedData, new Address(destination), "udp", clientInfo.ConnectionId);
                 DebugOutput($"Transmitted {receivedData.Length} bytes to Tetronet (conn {clientInfo.ConnectionId})");
             }
             catch (Exception ex)
             {
                 DebugOutput($"Transmit error for {clientInfo.ConnectionId}: {ex.Message}");
-                modem.Transmit([0x00], new Address(destination), "udp_reset", clientInfo.ConnectionId);
+                modem.LowLevelTransmit([0x00], new Address(destination), "udp_reset", clientInfo.ConnectionId);
                 activeConnections.TryRemove(clientKey, out _);
             }
         }
