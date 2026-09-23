@@ -11,6 +11,9 @@ Allows you to carry abritraty data, that was originally UDP, it will forward it 
 
 Tested with video transmission over the tetronet using SRT protocol, programs - FFMpeg, protocol - MPEG-TS over SRT. No other use cases were tested, it could possibly run other UDP-based protocols, but I'm not sure. Just don't break anything ;)
 
+<img width="260" height="696" alt="image" src="https://github.com/user-attachments/assets/18d43c09-b5ae-47e5-99bb-88f37a38d02f" />
+
+
 ### Speed
 Enough for video streaming, I tested it, got about 12 Mbps.
 
