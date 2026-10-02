@@ -30,7 +30,7 @@ void DebugOutput(object d)
 IModem modem;
 if (virtualOrCiocil == "virtual")
 {
-    VirtualModem modem_ = new VirtualModem(websocketProviderUrl, new(), rawWs:wiretype == "websock");
+    VirtualModem modem_ = new(websocketProviderUrl, new(), rawWs:wiretype == "websock");
     modem_.OnReconnectWebsocket += delegate ()
     {
         Console.WriteLine("Raw Websocket is reconnecting...");

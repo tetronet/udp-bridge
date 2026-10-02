@@ -86,15 +86,14 @@ modem.AttachReceiveEventNoUnfragment(delegate (Packet received, Action k)
                 if (received.DataBytes.Length < 100)
                 {
                     modem.LowLevelTransmit([0x00], received.Transmitter, "pong", received.ConnectionID);
-                    Console.WriteLine($"[EVENT]: Response for client's ping packet (ping connection id is {received.ConnectionID})");
                 }
                 else
                 {
                     byte[] pingData = new byte[rnd.Next(30000)];
                     rnd.NextBytes(pingData);
                     modem.LowLevelTransmit(pingData, received.Transmitter, "pong", received.ConnectionID);
-                    Console.WriteLine($"[EVENT]: Response for client's ping packet (ping connection id is {received.ConnectionID})");
                 }
+                Console.WriteLine($"[EVENT]: Response for client's ping packet (ping connection id is {received.ConnectionID}, TTL is {received.RoutersToPass})");
             }
             catch
             {
@@ -102,8 +101,7 @@ modem.AttachReceiveEventNoUnfragment(delegate (Packet received, Action k)
             }
         });
     }
-
-    if (received.QueryType == "udp")
+    else if (received.QueryType == "udp")
     {
         if (udpClients.TryGetValue(received.ConnectionID, out UdpClient? udpClient))
         {
@@ -122,8 +120,7 @@ modem.AttachReceiveEventNoUnfragment(delegate (Packet received, Action k)
             DebugOutput($"[WARNING]: No UDP client for connection {received.ConnectionID}");
         }
     }
-
-    if (received.QueryType == "udp_connect")
+    else if (received.QueryType == "udp_connect")
     {
         try
         {
@@ -151,6 +148,8 @@ modem.AttachReceiveEventNoUnfragment(delegate (Packet received, Action k)
 
                 // start async reader
                 _ = Task.Run(() => ReadFromUdpAsync(received.ConnectionID, udpClient, dest, port));
+
+                Console.WriteLine($"[SUCCESS]: Created the client! Now there are {udpClients.Count} clients active");
             }
             else
             {
@@ -162,8 +161,7 @@ modem.AttachReceiveEventNoUnfragment(delegate (Packet received, Action k)
             Console.WriteLine($"[ERROR]: UDP client creation failed: {e}: {e.Message}");
         }
     }
-
-    if (received.QueryType == "udp_reset")
+    else if (received.QueryType == "udp_reset")
     {
         try
         {
@@ -188,6 +186,11 @@ modem.AttachReceiveEventNoUnfragment(delegate (Packet received, Action k)
                 udpClients.TryRemove(received.ConnectionID, out _);
 
                 Console.WriteLine("[INFO]: UDP client was closed (UDP RESET)");
+            }
+            else
+            {
+                DebugOutput($"[WARNING]: No UDP client for connection {received.ConnectionID}, telling sender to reset");
+                _ = Task.Run(() => modem.LowLevelTransmit([0x00], received.Transmitter, "udp_reset", received.ConnectionID));
             }
         }
         catch (Exception ex)
@@ -258,7 +261,7 @@ async Task ReadFromUdpAsync(uint connectionId, UdpClient udpClient, IPAddress ta
         await CleanupUdpConnection(connectionId, udpClient);
     }
 }
-
+/*
 async Task CleanupUdpConnection(uint connectionId, UdpClient udpClient)
 {
     if (udpClients.ContainsKey(connectionId))
@@ -308,6 +311,24 @@ async Task CleanupUdpConnection(uint connectionId, UdpClient udpClient)
         }
 
         Console.WriteLine($"[INFO]: Connection {connectionId} cleaned up after UDP close");
+    }
+}*/
+
+async Task CleanupUdpConnection(uint connectionId, UdpClient udpClient)
+{
+    // Reader loop, timer and udp_reset can all race here; only the first one proceeds
+    if (!udpClients.TryRemove(connectionId, out _)) return;
+
+    udpConnectionMap.TryRemove(udpClient, out _);
+    udpBuffers.TryRemove(connectionId, out _);
+    udpAddressMap.TryRemove(udpClient, out Address? addr); // capture BEFORE using it
+    try { udpClient.Close(); } catch { }
+
+    Console.WriteLine($"[INFO]: Connection {connectionId} cleaned up");
+    if (addr != null)
+    {
+        try { modem.LowLevelTransmit([0x00], addr, "udp_reset", connectionId); }
+        catch (Exception ex) { Console.WriteLine($"[ERROR]: Failed to send udp_reset: {ex.Message}"); }
     }
 }
 
