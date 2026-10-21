@@ -2,13 +2,13 @@
 using System.Collections.Concurrent;
 using System.Net;
 using System.Net.Sockets;
+using System.Threading.Channels;
 
 Console.WriteLine("UDP-Bridge v1.0 (Optimized for Tetronet)");
 
 string[] config = File.ReadAllLines("config.txt");
 
 Address? wantedAddress = null;
-Random rnd = new Random();
 if (File.Exists("ci_address.txt"))
 {
     wantedAddress = new(File.ReadAllText("ci_address.txt"));
@@ -20,16 +20,10 @@ if (config[0] != "server")
     throw new FormatException("config line 1 not \"server\"");
 }
 string wsProvider = config[1];
-string ipAddressDest = config[2];
-string ipAddressPort = config[3];
-string verbosity = config[4];
-void DebugOutput(object d)
-{
-    if (verbosity == "verbose")
-    {
-        Console.WriteLine(d);
-    }
-}
+// parsed once instead of on every udp_connect
+IPAddress targetAddress = IPAddress.Parse(config[2]);
+int targetPort = int.Parse(config[3]);
+bool verbose = config[4] == "verbose";
 IModem modem;
 if (config[5] == "virtual")
 {
@@ -46,7 +40,7 @@ else if (config[5] == "ciocil")
     {
         Console.WriteLine($"[WARNING]: Level One dropped {count} bytes, reason is {reason}");
     };
-    modem = mdm;    
+    modem = mdm;
 }
 else
 {
@@ -64,271 +58,161 @@ Console.WriteLine("OK");
 Console.WriteLine("[INFO]: Connected to tetronet with address " + (modem.LocalModemAddress ?? throw new NullAddressException()).AddressValue);
 File.WriteAllText("ci_address.txt", modem.LocalModemAddress.AddressValue);
 
-// Словари для UDP
-ConcurrentDictionary<UdpClient, Address> udpAddressMap = [];  // Dest IP string -> Tetronet Address
-ConcurrentDictionary<uint, UdpClient> udpClients = [];        // ConnectionID -> UdpClient
-ConcurrentDictionary<UdpClient, uint> udpConnectionMap = [];  // UdpClient -> ConnectionID
-ConcurrentDictionary<uint, MemoryStream> udpBuffers = [];     // buffers
+// All transmissions go through a single sender task: VirtualModem's raw websocket
+// does not allow concurrent SendAsync calls (it reconnects on that error), and every
+// UDP reader loop below would otherwise call LowLevelTransmit in parallel.
+TetronetSender sender = new(modem, verbose);
+
+// ConnectionID -> UDP session (socket + tetronet address of the peer)
+ConcurrentDictionary<uint, UdpSession> udpSessions = [];
 
 modem.AttachReceiveEventNoUnfragment(delegate (Packet received, Action k)
 {
-    DebugOutput($"[INFO]: Type: {received.QueryType}");
-    DebugOutput($"        Length: {received.DataBytes.Length}");
-    DebugOutput($"        ConnectionID: {received.ConnectionID}");
-
-    if (received.QueryType == "ping")
+    // runs on the modem's reader thread, so nothing here may block
+    if (verbose)
     {
-        _ = Task.Run(delegate ()
-        {
-            try
-            {
-                // Transmit different data in a ping packet to prevent network from caching the request
-                if (received.DataBytes.Length < 100)
-                {
-                    modem.LowLevelTransmit([0x00], received.Transmitter, "pong", received.ConnectionID);
-                }
-                else
-                {
-                    byte[] pingData = new byte[rnd.Next(30000)];
-                    rnd.NextBytes(pingData);
-                    modem.LowLevelTransmit(pingData, received.Transmitter, "pong", received.ConnectionID);
-                }
-                Console.WriteLine($"[EVENT]: Response for client's ping packet (ping connection id is {received.ConnectionID}, TTL is {received.RoutersToPass})");
-            }
-            catch
-            {
-                DebugOutput("[ERROR]: Failed to answer to ping request");
-            }
-        });
+        Console.WriteLine($"[INFO]: Type: {received.QueryType}");
+        Console.WriteLine($"        Length: {received.DataBytes.Length}");
+        Console.WriteLine($"        ConnectionID: {received.ConnectionID}");
     }
-    else if (received.QueryType == "udp")
+
+    switch (received.QueryType)
     {
-        if (udpClients.TryGetValue(received.ConnectionID, out UdpClient? udpClient))
-        {
-            try
+        case "udp":
+            if (udpSessions.TryGetValue(received.ConnectionID, out UdpSession? session))
             {
-                udpClient.SendAsync(received.DataBytes, received.DataBytes.Length);
-                DebugOutput($"[EVENT]: Sent UDP datagram of {received.DataBytes.Length} bytes for connection {received.ConnectionID}");
+                try
+                {
+                    session.Client.Client.Send(received.DataBytes, SocketFlags.None);
+                    if (verbose) Console.WriteLine($"[EVENT]: Sent UDP datagram of {received.DataBytes.Length} bytes for connection {received.ConnectionID}");
+                }
+                catch (Exception ex)
+                {
+                    if (verbose) Console.WriteLine($"[ERROR]: Sending UDP datagram failed: {ex.Message}");
+                }
             }
-            catch (Exception ex)
+            else if (verbose)
             {
-                DebugOutput($"[ERROR]: Sending UDP datagram failed: {ex.Message}");
+                Console.WriteLine($"[WARNING]: No UDP client for connection {received.ConnectionID}");
             }
-        }
-        else
-        {
-            DebugOutput($"[WARNING]: No UDP client for connection {received.ConnectionID}");
-        }
-    }
-    else if (received.QueryType == "udp_connect")
-    {
-        try
-        {
-            Console.WriteLine("[EVENT]: Received udp_connect packet for connection " + received.ConnectionID);
-            if (!udpClients.TryGetValue(received.ConnectionID, out UdpClient? value))
+            break;
+        case "ping":
+            // Transmit different data in a ping packet to prevent network from caching the request
+            if (received.DataBytes.Length < 100)
             {
-                Console.WriteLine("[INFO]: Creating UDP client: " + received.ConnectionID);
-
-                IPAddress dest = IPAddress.Parse(ipAddressDest);
-                int port = int.Parse(ipAddressPort);
-
-                Console.WriteLine($"[INFO]: Target IP:Port = {dest}:{port}");
-
-                var udpClient = new UdpClient();
-
-                udpClient.Client.Bind(new IPEndPoint(IPAddress.Any, 0));
-                udpClient.Connect(dest, port);
-                // save
-                udpClients[received.ConnectionID] = udpClient;
-                udpAddressMap[udpClient] = received.Transmitter;
-                udpConnectionMap[udpClient] = received.ConnectionID;
-
-                // create buffer
-                udpBuffers[received.ConnectionID] = new MemoryStream();
-
-                // start async reader
-                _ = Task.Run(() => ReadFromUdpAsync(received.ConnectionID, udpClient, dest, port));
-
-                Console.WriteLine($"[SUCCESS]: Created the client! Now there are {udpClients.Count} clients active");
+                sender.SendControl([0x00], received.Transmitter, "pong", received.ConnectionID);
             }
             else
             {
-                Console.WriteLine("[ERROR]: Cannot create UDP client, connection already exists: " + received.ConnectionID);
+                byte[] pingData = new byte[Random.Shared.Next(30000)];
+                Random.Shared.NextBytes(pingData);
+                sender.SendControl(pingData, received.Transmitter, "pong", received.ConnectionID);
             }
-        }
-        catch (Exception e)
-        {
-            Console.WriteLine($"[ERROR]: UDP client creation failed: {e}: {e.Message}");
-        }
-    }
-    else if (received.QueryType == "udp_reset")
-    {
-        try
-        {
-            if (udpClients.TryGetValue(received.ConnectionID, out UdpClient? value))
+            Console.WriteLine($"[EVENT]: Response for client's ping packet (ping connection id is {received.ConnectionID}, TTL is {received.RoutersToPass})");
+            break;
+        case "udp_connect":
+            Console.WriteLine("[EVENT]: Received udp_connect packet for connection " + received.ConnectionID);
+            if (udpSessions.ContainsKey(received.ConnectionID))
             {
-                string ipToRemove = "";
-                if (udpClients[received.ConnectionID].Client.RemoteEndPoint != null)
+                Console.WriteLine("[ERROR]: Cannot create UDP client, connection already exists: " + received.ConnectionID);
+                break;
+            }
+            UdpClient? udpClient = null;
+            try
+            {
+                Console.WriteLine("[INFO]: Creating UDP client: " + received.ConnectionID);
+                Console.WriteLine($"[INFO]: Target IP:Port = {targetAddress}:{targetPort}");
+
+                udpClient = new UdpClient(targetAddress.AddressFamily);
+                udpClient.Connect(targetAddress, targetPort);
+                UdpSession newSession = new(received.ConnectionID, udpClient, received.Transmitter);
+                if (!udpSessions.TryAdd(received.ConnectionID, newSession))
                 {
-                    ipToRemove = ((IPEndPoint)(udpClients[received.ConnectionID].Client.RemoteEndPoint ?? throw new NullAddressException("null ip endpoint"))).Address.MapToIPv4().ToString();
-                }
-                else
-                {
-                    // If RemoteEndPoint isn't available, try to find ConnectionID in the udpConnectionMap
-                    var entry = udpConnectionMap.FirstOrDefault(x => x.Value == received.ConnectionID);
-                    ipToRemove = ((IPEndPoint)(entry.Key.Client.RemoteEndPoint ?? throw new NullAddressException("null ip endpoint"))).Address.MapToIPv4().ToString();
+                    udpClient.Dispose();
+                    Console.WriteLine("[ERROR]: Cannot create UDP client, connection already exists: " + received.ConnectionID);
+                    break;
                 }
 
-                udpAddressMap.TryRemove(value, out _);
-                udpConnectionMap.TryRemove(value, out _);
-                udpBuffers.TryRemove(received.ConnectionID, out _);
-                value.Close();
-                udpClients.TryRemove(received.ConnectionID, out _);
+                // start async reader
+                _ = Task.Run(() => ReadFromUdpAsync(newSession));
 
+                Console.WriteLine($"[SUCCESS]: Created the client! Now there are {udpSessions.Count} clients active");
+            }
+            catch (Exception e)
+            {
+                udpClient?.Dispose();
+                Console.WriteLine($"[ERROR]: UDP client creation failed: {e}: {e.Message}");
+            }
+            break;
+        case "udp_reset":
+            if (udpSessions.TryGetValue(received.ConnectionID, out UdpSession? resetSession))
+            {
+                // the peer asked for it, so don't echo udp_reset back
+                CleanupUdpConnection(resetSession, sendReset: false);
                 Console.WriteLine("[INFO]: UDP client was closed (UDP RESET)");
             }
             else
             {
-                DebugOutput($"[WARNING]: No UDP client for connection {received.ConnectionID}, telling sender to reset");
-                _ = Task.Run(() => modem.LowLevelTransmit([0x00], received.Transmitter, "udp_reset", received.ConnectionID));
+                if (verbose) Console.WriteLine($"[WARNING]: No UDP client for connection {received.ConnectionID}, telling sender to reset");
+                sender.SendControl([0x00], received.Transmitter, "udp_reset", received.ConnectionID);
             }
-        }
-        catch (Exception ex)
-        {
-            Console.WriteLine($"[ERROR]: UDP reset has failed: {ex.Message}");
-        }
+            break;
     }
 });
 
 // async reading
-async Task ReadFromUdpAsync(uint connectionId, UdpClient udpClient, IPAddress targetAddress, int targetPort)
+async Task ReadFromUdpAsync(UdpSession session)
 {
-    byte[] buffer = new byte[65535];
-
     try
     {
-        udpClient.Connect(targetAddress, targetPort);
-
-        while (udpClient.Client != null && udpClient.Client.Connected)
+        while (true)
         {
+            UdpReceiveResult result;
             try
             {
                 // read dgram
-                var result = await udpClient.ReceiveAsync();
-                int bytesRead = result.Buffer.Length;
-
-                if (bytesRead == 0)
-                {
-                    // sometimes there can be a 0-length dgram
-                    continue;
-                }
-
-                // UDP->Tetronet forward process
-                byte[] data = new byte[bytesRead];
-                Array.Copy(result.Buffer, data, bytesRead);
-
-                // Get address
-                string destIp = targetAddress.MapToIPv4().ToString();
-
-                if (udpAddressMap.TryGetValue(udpClient, out Address? value) && udpConnectionMap.ContainsKey(udpClient))
-                {
-                    // Send the packet over the tetronet
-                    modem.LowLevelTransmit(data, value, "udp", udpConnectionMap[udpClient]);
-                    DebugOutput($"[EVENT]: Transmitted UDP datagram of {bytesRead} bytes from {connectionId} to Tetronet");
-                }
-                else
-                {
-                    Console.WriteLine($"[ERROR]: No mapping for destination {destIp}");
-                }
+                result = await session.Client.ReceiveAsync();
             }
             catch (SocketException ex) when (ex.SocketErrorCode == SocketError.TimedOut)
             {
                 continue;
             }
-            catch (Exception ex)
+            catch (ObjectDisposedException)
             {
-                Console.WriteLine($"[ERROR]: Reading from UDP {connectionId} failed: {ex.Message}");
+                // closed by udp_reset or the dead connection cleanup
                 break;
             }
+            catch (Exception ex)
+            {
+                Console.WriteLine($"[ERROR]: Reading from UDP {session.ConnectionId} failed: {ex.Message}");
+                break;
+            }
+
+            // sometimes there can be a 0-length dgram
+            if (result.Buffer.Length == 0) continue;
+
+            // UDP->Tetronet forward process (Buffer is already a fresh array, no copy needed)
+            sender.SendData(result.Buffer, session.PeerAddress, "udp", session.ConnectionId);
+            if (verbose) Console.WriteLine($"[EVENT]: Queued UDP datagram of {result.Buffer.Length} bytes from {session.ConnectionId} to Tetronet");
         }
-    }
-    catch (Exception ex)
-    {
-        Console.WriteLine($"[ERROR]: UDP receive loop failed for {connectionId}: {ex.Message}");
     }
     finally
     {
-        await CleanupUdpConnection(connectionId, udpClient);
+        CleanupUdpConnection(session, sendReset: true);
     }
 }
-/*
-async Task CleanupUdpConnection(uint connectionId, UdpClient udpClient)
-{
-    if (udpClients.ContainsKey(connectionId))
-    {
-        UdpClient? clToRemove = null;
 
-        var entry = udpConnectionMap.FirstOrDefault(x => x.Value == connectionId);
-        if (entry.Key != null)
-        {
-            clToRemove = entry.Key;
-        }
-        else if (udpClient.Client.RemoteEndPoint != null)
-        {
-            clToRemove = udpClient;
-        }
-
-        if (clToRemove != null)
-        {
-            udpAddressMap.TryRemove(clToRemove, out _);
-            udpConnectionMap.TryRemove(clToRemove, out _);
-        }
-
-        udpBuffers.TryRemove(connectionId, out _);
-
-        try
-        {
-            udpClient.Close();
-        }
-        catch { }
-
-        udpClients.TryRemove(connectionId, out _);
-
-        if (clToRemove != null && udpAddressMap.TryGetValue(clToRemove, out Address? addr))
-        {
-            Console.WriteLine($"[INFO]: Connection for UDP client {connectionId} with dest IP {clToRemove} was closed");
-            Console.WriteLine($"[INFO]: Transmitting udp_reset to address {addr.AddressValue}");
-
-            try
-            {
-                await Task.Run(() => modem.Transmit([0x00], addr, "udp_reset", connectionId));
-                Console.WriteLine($"[INFO]: Transmitted udp_reset signal for {connectionId} to tetronet for IP {clToRemove}");
-            }
-            catch (Exception ex)
-            {
-                Console.WriteLine($"[ERROR]: Failed to send udp_reset: {ex.Message}");
-            }
-        }
-
-        Console.WriteLine($"[INFO]: Connection {connectionId} cleaned up after UDP close");
-    }
-}*/
-
-async Task CleanupUdpConnection(uint connectionId, UdpClient udpClient)
+void CleanupUdpConnection(UdpSession session, bool sendReset)
 {
     // Reader loop, timer and udp_reset can all race here; only the first one proceeds
-    if (!udpClients.TryRemove(connectionId, out _)) return;
+    if (!udpSessions.TryRemove(new KeyValuePair<uint, UdpSession>(session.ConnectionId, session))) return;
 
-    udpConnectionMap.TryRemove(udpClient, out _);
-    udpBuffers.TryRemove(connectionId, out _);
-    udpAddressMap.TryRemove(udpClient, out Address? addr); // capture BEFORE using it
-    try { udpClient.Close(); } catch { }
+    try { session.Client.Close(); } catch { }
 
-    Console.WriteLine($"[INFO]: Connection {connectionId} cleaned up");
-    if (addr != null)
+    Console.WriteLine($"[INFO]: Connection {session.ConnectionId} cleaned up");
+    if (sendReset)
     {
-        try { modem.LowLevelTransmit([0x00], addr, "udp_reset", connectionId); }
-        catch (Exception ex) { Console.WriteLine($"[ERROR]: Failed to send udp_reset: {ex.Message}"); }
+        sender.SendControl([0x00], session.PeerAddress, "udp_reset", session.ConnectionId);
     }
 }
 
@@ -339,41 +223,38 @@ _ = Task.Run(async () =>
     {
         await Task.Delay(30000);
 
-        List<uint> deadConnections = [];
-
-        foreach (var kv in udpClients)
+        foreach (var kv in udpSessions)
         {
+            bool dead;
             try
             {
-                if (kv.Value.Client == null || !kv.Value.Client.IsBound)
+                Socket socket = kv.Value.Client.Client;
+                if (socket == null || !socket.IsBound)
                 {
-                    deadConnections.Add(kv.Key);
                     Console.WriteLine("[WARNING]: Detected dead UDP client. This client is going to be deleted.");
                     Console.WriteLine("           ClientID: " + kv.Key);
-                    continue;
+                    dead = true;
                 }
-
-                if (kv.Value.Client.Poll(0, SelectMode.SelectError))
+                else
                 {
-                    deadConnections.Add(kv.Key);
-                    Console.WriteLine($"[WARNING]: UDP client {kv.Key} has error state");
+                    dead = socket.Poll(0, SelectMode.SelectError);
+                    if (dead) Console.WriteLine($"[WARNING]: UDP client {kv.Key} has error state");
                 }
             }
             catch (Exception e)
             {
                 Console.WriteLine($"[ERROR]: Connection had a fatal failure: {e}");
-                deadConnections.Add(kv.Key);
+                dead = true;
+            }
+
+            if (dead)
+            {
+                Console.WriteLine($"[INFO]: Connection {kv.Key} detected as dead, cleaning up");
+                CleanupUdpConnection(kv.Value, sendReset: true);
             }
         }
 
-        foreach (var id in deadConnections)
-        {
-            Console.WriteLine($"[INFO]: Connection {id} detected as dead, cleaning up");
-            if (udpClients.TryGetValue(id, out UdpClient? client))
-            {
-                await CleanupUdpConnection(id, client);
-            }
-        }
+        if (verbose) Console.WriteLine($"[STATUS]: {udpSessions.Count} UDP clients, queued to Tetronet: {sender.QueuedData}, dropped: {sender.DroppedData}");
     }
 });
 
@@ -381,3 +262,79 @@ _ = Task.Run(async () =>
 
 Console.WriteLine("[STATUS]: Waiting for UDP clients...");
 Console.ReadLine();
+
+sealed class UdpSession(uint connectionId, UdpClient client, Address peerAddress)
+{
+    public uint ConnectionId { get; } = connectionId;
+    public UdpClient Client { get; } = client;
+    /// <summary>Tetronet address that opened this connection.</summary>
+    public Address PeerAddress { get; } = peerAddress;
+}
+
+/// <summary>
+/// Serializes every transmission into the modem from one background task.
+/// Control packets (pong/reset) are never dropped and go out first;
+/// UDP data goes through a bounded queue and the oldest datagrams are dropped
+/// when the Tetronet link can't keep up, so latency doesn't grow without limit.
+/// </summary>
+sealed class TetronetSender
+{
+    private readonly record struct Outgoing(byte[] Data, Address Address, string QueryType, uint ConnectionId);
+
+    private readonly IModem modem;
+    private readonly bool verbose;
+    private readonly Channel<Outgoing> control = Channel.CreateUnbounded<Outgoing>(new() { SingleReader = true });
+    private readonly Channel<Outgoing> data;
+    // One permit per queued item. Waiting on both channels' WaitToReadAsync instead would
+    // cancel the previous waiter of the single-reader channel on every packet
+    // (OperationCanceledException each time).
+    private readonly SemaphoreSlim itemsAvailable = new(0);
+    private long droppedData;
+
+    public long DroppedData => Interlocked.Read(ref droppedData);
+    public int QueuedData => data.Reader.Count;
+
+    public TetronetSender(IModem modem, bool verbose, int dataCapacity = 4096)
+    {
+        this.modem = modem;
+        this.verbose = verbose;
+        data = Channel.CreateBounded<Outgoing>(new BoundedChannelOptions(dataCapacity)
+        {
+            SingleReader = true,
+            FullMode = BoundedChannelFullMode.DropOldest
+        }, delegate (Outgoing _) { Interlocked.Increment(ref droppedData); });
+        Task.Factory.StartNew(Run, TaskCreationOptions.LongRunning);
+    }
+
+    public void SendControl(byte[] bytes, Address address, string queryType, uint connectionId)
+    {
+        if (control.Writer.TryWrite(new(bytes, address, queryType, connectionId))) itemsAvailable.Release();
+    }
+
+    public void SendData(byte[] bytes, Address address, string queryType, uint connectionId)
+    {
+        // with DropOldest a dropped item leaves a spare permit; Run just finds nothing and waits again
+        if (data.Writer.TryWrite(new(bytes, address, queryType, connectionId))) itemsAvailable.Release();
+    }
+
+    private void Run()
+    {
+        while (true)
+        {
+            itemsAvailable.Wait();
+            if (!control.Reader.TryRead(out Outgoing item) && !data.Reader.TryRead(out item))
+            {
+                continue;
+            }
+            try
+            {
+                modem.LowLevelTransmit(item.Data, item.Address, item.QueryType, item.ConnectionId);
+                if (verbose && item.QueryType == "udp") Console.WriteLine($"[EVENT]: Transmitted UDP datagram of {item.Data.Length} bytes from {item.ConnectionId} to Tetronet");
+            }
+            catch (Exception ex)
+            {
+                Console.WriteLine($"[ERROR]: Transmit failed ({item.QueryType}, conn {item.ConnectionId}): {ex.Message}");
+            }
+        }
+    }
+}
